@@ -1,6 +1,8 @@
 """Japanese G-Maze distractor generator (Boyce et al. 2020 design).
 
-Usage: python maze_japanese.py input.txt output.txt [--seed N] [-p params.txt]
+Usage:
+    python maze_japanese.py input.txt output.txt [--seed N] [-p params.txt]
+    python maze_japanese.py --validate output.txt [-v]
 """
 
 
@@ -15,15 +17,14 @@ import os
 import pickle
 import random
 import re
+import sys
 import time
 import urllib.request
 import urllib.error
 from collections import Counter
 from typing import Dict, List, Optional
 
-import torch
 import wordfreq
-from transformers import AutoModelForCausalLM, AutoTokenizer
 
 try:
     import fugashi
@@ -32,22 +33,31 @@ except ImportError:
     _FUGASHI_AVAILABLE = False
     logging.warning("fugashi not installed; raw Japanese input will not be auto-tokenized.")
 
+try:
+    import torch
+    from transformers import AutoTokenizer, AutoModelForCausalLM
+    _LM_AVAILABLE = True
+except ImportError:
+    _LM_AVAILABLE = False
+    logging.warning("torch/transformers not installed; LM-based surprisal scoring disabled.")
+
 
 DEFAULT_MODEL_NAME = "rinna/japanese-gpt2-medium"
 
 DEFAULT_PARAMS: Dict = {
-    "min_pmi":     14.0,
-    "min_abs":     21.0,
-    "num_to_test":  80,        # max candidates per slot
-    "max_repeat":    0,        # max reuses of exact form (0 = stem-cap only)
-    "model_name": DEFAULT_MODEL_NAME,
-    "grade_level":   6,        # kanji filter: 0 = off, 1-6 = elementary grade
+    "num_to_test":      80,    # max candidates per slot
+    "max_repeat":        0,    # max reuses of exact form (0 = stem-cap only)
+    "grade_level":       6,    # kanji filter: 0 = off, 1-6 = elementary grade
+    "use_lm":         True,    # rank candidates by LM surprisal
+    "model_name":     DEFAULT_MODEL_NAME,
+    "min_surprisal":  14.0,    # bits — distractor must surprise the LM by ≥ this
+    "surprisal_ceiling": 35.0, # bits — above this means LM-OOV (unreliable)
+    "freq_match_band": 2.0,    # log-freq tolerance vs target_freq
+    "disable_noun_in_verb_slot": True,  # don't inject noun+particle into verb slots
 }
 
-_SURPRISAL_CEILING = 35.0
 
-
-_POOL_CACHE_VERSION = 18
+_POOL_CACHE_VERSION = 20
 
 
 _FREQ_BIN_WIDTH  = 0.1   # log-freq units per bin
@@ -72,6 +82,7 @@ _PUNCT_FINAL = re.compile(r'[。！？]$')
 
 
 _CASE_PARTICLES = frozenset({"が", "を", "に", "で", "は"})
+_CASE_PARTICLES_SORTED = sorted(_CASE_PARTICLES, key=len, reverse=True)
 
 # Only が and を give CATEGORICAL double-particle violations within a clause.
 # に, で, は can grammatically repeat (time+location, topic+contrastive, etc.),
@@ -82,6 +93,7 @@ _ALL_PARTICLES = [
     "が", "を", "に", "で", "は", "の", "と",
     "から", "まで", "へ", "も",
 ]
+_ALL_PARTICLES_SORTED = sorted(_ALL_PARTICLES, key=len, reverse=True)
 
 
 _CONTENT_POS = frozenset({
@@ -254,14 +266,6 @@ _EXCLUDED_DISTRACTOR_POS = frozenset({
     "助数詞",   # counters
 })
 
-_ABSTRACT_NOUN_SUBS = frozenset({
-    "副詞可能",     # adverbial nouns (前, 後, 時)
-    "非自立可能",   # formal / dependent nouns
-    "形状詞可能",   # adjectival nouns overlapping na-adj
-    "助数詞可能",   # counter-capable nouns
-})
-
-
 _FORMAL_NOUNS = frozenset({
     "事", "こと", "もの", "物", "者", "方", "所", "ところ",
     "前", "後", "上", "下", "中", "間", "時", "頃",
@@ -270,14 +274,6 @@ _FORMAL_NOUNS = frozenset({
 _FORMAL_NOUN_CAP = 2   # max uses per formal-noun stem across the run
 _STEM_VARIETY_CAP = 2  # max uses per ANY content stem (prevents 世界×10)
 
-_BORING_WORDS = frozenset({
-    "こと", "事", "もの", "物", "とき", "時", "ため", "為",
-    "ほう", "方", "わけ", "ほか", "他", "たち", "あと", "後",
-    "まえ", "前", "うち", "なか", "中",
-})
-_BORING_PENALTY = 5.0  # extra bits added to surprisal threshold
-
-_KATAKANA_BONUS = -0.3
 
 _STANDALONE_SINGLE_CHAR = frozenset({
     "犬", "猫", "馬", "鳥", "魚", "虫", "花", "木", "山", "川",
@@ -375,15 +371,6 @@ def _word_ok_kanji(word: str, whitelist: Optional[set]) -> bool:
 def _freq_bin(logfreq: float) -> int:
     """Map a log-frequency value to an integer bin index."""
     return int(logfreq / _FREQ_BIN_WIDTH)
-
-
-_LOG2_1E9 = math.log2(1e9)          # ≈ 29.897
-_INV_LN2  = 1.0 / math.log(2)       # ≈ 1.443
-
-
-def _unigram_bits(logfreq: float) -> float:
-    """Unigram surprisal of a word in bits, from wordfreq's logfreq."""
-    return _LOG2_1E9 - logfreq * _INV_LN2
 
 
 def _no_duplicates(lst: List) -> bool:
@@ -508,30 +495,41 @@ class JapaneseTokenizer:
         return bunsetsu
 
     def get_bunsetsu_info(self, bunsetsu: str) -> Dict:
-        """Analyse a bunsetsu and return its POS, trailing particle, and stem."""
+        """Return functional POS ('noun'/'verb'/'adj'/'adv'/'other') and trailing particle.
+
+        Functional, not first-morpheme: a 名詞+する compound (説明した) returns
+        'verb' because the bunsetsu acts as a verb in the sentence.
+        Adjectives take precedence over verbs only when no verb morpheme
+        exists (handles past-adj 細かかった correctly).
+        """
         morphemes = self._tagger(bunsetsu)
         if not morphemes:
-            return {"pos": "other", "particle": "", "stem": bunsetsu}
+            return {"pos": "other", "particle": ""}
 
-        first_content_pos = "other"
-        _POS_MAP = {"名詞": "noun", "動詞": "verb",
-                     "形容詞": "adj", "形容動詞": "adj", "副詞": "adv"}
-        for m in morphemes:
-            p = self._pos(m)
-            if p in _CONTENT_POS:
-                first_content_pos = _POS_MAP.get(p, "other")
-                break
+        has_verb = any(self._pos(m) == "動詞" for m in morphemes)
+        has_adj  = any(self._pos(m) in ("形容詞", "形容動詞") for m in morphemes)
+
+        if has_verb:
+            first_content_pos = "verb"
+        elif has_adj:
+            first_content_pos = "adj"
+        else:
+            first_content_pos = "other"
+            _POS_MAP = {"名詞": "noun", "副詞": "adv"}
+            for m in morphemes:
+                p = self._pos(m)
+                if p in _CONTENT_POS:
+                    first_content_pos = _POS_MAP.get(p, "other")
+                    break
 
         stem_end = len(morphemes)
         for i in range(len(morphemes) - 1, -1, -1):
-            p = self._pos(morphemes[i])
-            if p in ("助詞", "記号"):
+            if self._pos(morphemes[i]) in ("助詞", "記号"):
                 stem_end = i
             else:
                 break
         particle = "".join(m.surface for m in morphemes[stem_end:])
-        stem = "".join(m.surface for m in morphemes[:stem_end])
-        return {"pos": first_content_pos, "particle": particle, "stem": stem}
+        return {"pos": first_content_pos, "particle": particle}
 
 
 def _conjugate_past(dict_form: str, conj_type: str) -> Optional[str]:
@@ -571,136 +569,85 @@ def _conjugate_past(dict_form: str, conj_type: str) -> Optional[str]:
 
 
 class JapaneseGPT2LM:
-    """Wrapper around a Hugging Face causal LM for surprisal computation."""
+    """KV-cached batched surprisal scorer over rinna/japanese-gpt2-medium."""
 
     def __init__(self, model_name: str = DEFAULT_MODEL_NAME):
-        print(f"Loading Japanese LM: {model_name}")
-        self._tokenizer = AutoTokenizer.from_pretrained(model_name, use_fast=False)
+        if not _LM_AVAILABLE:
+            raise RuntimeError("torch/transformers not installed")
+        print(f"Loading LM: {model_name}...")
+        self._tok = AutoTokenizer.from_pretrained(model_name, use_fast=False)
         self._model = AutoModelForCausalLM.from_pretrained(model_name)
         self._model.eval()
-
-        if torch.cuda.is_available():
-            self._device = torch.device("cuda")
-        elif hasattr(torch.backends, "mps") and torch.backends.mps.is_available():
-            self._device = torch.device("mps")
-        else:
-            self._device = torch.device("cpu")
+        self._device = "cuda" if torch.cuda.is_available() else "cpu"
         self._model.to(self._device)
+        self._bos = self._tok.bos_token_id or self._tok.eos_token_id
+        self._inv_ln2 = 1.0 / math.log(2)
+        print(f"  device={self._device}, vocab={self._tok.vocab_size}")
 
-        self._pad_id = (
-            getattr(self._tokenizer, "pad_token_id", None)
-            or getattr(self._tokenizer, "eos_token_id", 0)
-            or 0
-        )
+    def encode_prefix(self, text: str) -> List[int]:
+        ids = self._tok.encode(text, add_special_tokens=False)
+        if self._bos is not None:
+            ids = [self._bos] + ids
+        return ids
 
-        if (self._device.type == "cuda"
-                and hasattr(torch, "compile")
-                and os.name != "nt"):
-            try:
-                self._model = torch.compile(self._model)
-                print(f"  running on {self._device} (torch.compile enabled)")
-            except Exception:
-                print(f"  running on {self._device} (torch.compile unavailable)")
-        else:
-            print(f"  running on {self._device}")
+    @torch.no_grad()
+    def get_surprisals(self, prefix_ids: List[int],
+                       candidates: List[str]) -> List[float]:
+        """Return surprisal in bits for each candidate given prefix.
 
-
-    def empty_sentence(self) -> tuple:
-        """Return an empty sentence context (no token IDs yet)."""
-        return ()
-
-    def update(self, ctx: tuple, word: str) -> tuple:
-        """Append *word*'s token IDs to the running context."""
-        return ctx + tuple(self._encode(word))
-
-
-    def get_surprisal(self, ctx: tuple, word: str) -> float:
-        """Single-word surprisal (bits) given context *ctx*."""
-        return self.get_surprisals_batch(ctx, [word])[0]
-
-    def get_surprisals_batch(self, ctx: tuple, words: List[str]) -> List[float]:
-        """Compute surprisal (bits) for many candidates using KV-caching."""
-        if not words:
+        Batches per token-length group: each group does one forward pass over
+        (B, prefix_len + cand_len) and reads off the candidate-token surprisals.
+        """
+        if not candidates:
             return []
-        all_ids = [self._encode(w) for w in words]
-        inv_ln2 = 1.0 / math.log(2)
+        cand_tokens = [self._tok.encode(c, add_special_tokens=False)
+                       for c in candidates]
+        results: List[float] = [float("inf")] * len(candidates)
 
-        prefix_ids = list(ctx) if ctx else [getattr(self._tokenizer, "bos_token_id", None) or 0]
+        by_len: Dict[int, List[tuple]] = {}
+        for i, toks in enumerate(cand_tokens):
+            if toks:
+                by_len.setdefault(len(toks), []).append((i, toks))
 
-        try:
-            prefix_inp = torch.tensor([prefix_ids], device=self._device)
-            with torch.no_grad():
-                prefix_out = self._model(prefix_inp, use_cache=True)
-                prefix_lp = torch.log_softmax(
-                    prefix_out.logits[0, -1, :], dim=-1
-                ).cpu()
-
-                past_kv_raw = prefix_out.past_key_values
-                if hasattr(past_kv_raw, "to_legacy_cache"):
-                    past_kv = past_kv_raw.to_legacy_cache()
-                elif not isinstance(past_kv_raw, tuple):
-                    past_kv = tuple(past_kv_raw)
-                else:
-                    past_kv = past_kv_raw
-        except Exception as exc:
-            logging.warning("prefix forward error: %s", exc)
-            return [0.0] * len(words)
-
-        results = [0.0] * len(words)
-        for i, ids in enumerate(all_ids):
-            if ids:
-                results[i] = -prefix_lp[ids[0]].item() * inv_ln2
-
-        multi = [(i, ids) for i, ids in enumerate(all_ids) if len(ids) > 1]
-        if not multi:
-            return results
-
-        max_cand_len = max(len(ids) for _, ids in multi)
-        batch_rows = [
-            ids + [self._pad_id] * (max_cand_len - len(ids))
-            for _, ids in multi
-        ]
-
-        try:
-            inp = torch.tensor(batch_rows, device=self._device)
-            B = len(batch_rows)
-            expanded_kv = tuple(
-                tuple(t.expand(B, *(-1,) * (t.dim() - 1)) for t in layer)
-                for layer in past_kv
+        plen = len(prefix_ids)
+        for L, group in by_len.items():
+            batch = torch.tensor(
+                [prefix_ids + toks for _, toks in group],
+                device=self._device,
             )
-            with torch.no_grad():
-                out = self._model(inp, past_key_values=expanded_kv, use_cache=False)
-                log_probs = torch.log_softmax(out.logits, dim=-1).cpu()
-        except Exception as exc:
-            logging.warning("KV-batched surprisal error: %s", exc)
-            return results
-
-        for batch_idx, (orig_idx, ids) in enumerate(multi):
-            total = results[orig_idx]   # first-token from step 2
-            for j in range(1, len(ids)):
-                total += -log_probs[batch_idx, j - 1, ids[j]].item() * inv_ln2
-            results[orig_idx] = total
-
+            logits = self._model(batch).logits  # (B, plen+L, vocab)
+            log_probs = torch.log_softmax(logits, dim=-1)
+            for j, (i, toks) in enumerate(group):
+                total = 0.0
+                for t in range(L):
+                    total += -log_probs[j, plen - 1 + t, toks[t]].item()
+                results[i] = total * self._inv_ln2
         return results
 
 
-    def _encode(self, text: str) -> List[int]:
-        """Tokenise *text* into a list of token IDs (no special tokens)."""
-        return self._tokenizer.encode(text, add_special_tokens=False)
+def _improbable_particles_for_position(prior_particles: List[str]) -> set:
+    """Particles that are structurally bad in a nominal position.
+
+    - Duplicate of any prior case particle (one が/を/に/で/は per clause).
+    - が or は after any prior particle (multiple subjects/topics improbable).
+    """
+    improbable = set(prior_particles) & _CASE_PARTICLES
+    if prior_particles:
+        improbable.add("が")
+        improbable.add("は")
+    return improbable
 
 
 class _BunsetsuEntry:
     """A single pre-formed distractor bunsetsu (e.g. '猫が', '走った')."""
-    __slots__ = ("text", "pos", "particle", "freq", "length", "concrete")
+    __slots__ = ("text", "pos", "particle", "freq", "length")
 
-    def __init__(self, text: str, pos: str, particle: str, freq: float,
-                 concrete: bool = True):
+    def __init__(self, text: str, pos: str, particle: str, freq: float):
         self.text = text
         self.pos = pos
         self.particle = particle   # 'が','を', etc. or '' for verbs/adjs
         self.freq = freq           # log-frequency from wordfreq
         self.length = len(text)
-        self.concrete = concrete   # False for abstract/formal/adverbial nouns
 
 
 class JapaneseDistractorDict:
@@ -720,7 +667,6 @@ class JapaneseDistractorDict:
                     state = pickle.load(f)
                 self._entries = state["entries"]
                 self._by_particle = state["by_particle"]
-                self._by_pos = state["by_pos"]
                 self._by_freq_bin = state.get("by_freq_bin", {})
                 if not self._by_freq_bin:
                     self._build_freq_bins()
@@ -743,7 +689,6 @@ class JapaneseDistractorDict:
         self._entries: List[_BunsetsuEntry] = []
         self._by_particle: Dict[str, List[_BunsetsuEntry]] = {p: [] for p in _ALL_PARTICLES}
         self._by_particle[""] = []
-        self._by_pos: Dict[str, List[_BunsetsuEntry]] = {}
         self._by_freq_bin: Dict[int, List[_BunsetsuEntry]] = {}
 
         counts = {"noun": 0, "verb": 0, "adj": 0, "skipped": 0}
@@ -774,7 +719,6 @@ class JapaneseDistractorDict:
 
             first_pos = ""
             conj_type = ""
-            first_pos_subs: List[str] = []
             content_count = 0
             is_bound = False
 
@@ -795,7 +739,6 @@ class JapaneseDistractorDict:
                     if not first_pos:
                         first_pos = p
                         conj_type = ct
-                        first_pos_subs = pos_subs
                     if (p == "接頭詞"
                             or p in _EXCLUDED_DISTRACTOR_POS
                             or any(b in s for s in pos_subs for b in _BOUND_POS_SUBS)):
@@ -832,19 +775,11 @@ class JapaneseDistractorDict:
                     counts["skipped"] += 1
                     continue
 
-            is_concrete = not any(
-                a in s for s in first_pos_subs for a in _ABSTRACT_NOUN_SUBS
-            )
-
             if first_pos == "名詞":
                 for particle in _CASE_PARTICLES:
-                    entry = _BunsetsuEntry(
-                        word + particle, "noun", particle, logfreq,
-                        concrete=is_concrete,
-                    )
+                    entry = _BunsetsuEntry(word + particle, "noun", particle, logfreq)
                     self._entries.append(entry)
                     self._by_particle[particle].append(entry)
-                    self._by_pos.setdefault("noun", []).append(entry)
                     counts["noun"] += 1
 
             elif first_pos == "動詞":
@@ -852,14 +787,12 @@ class JapaneseDistractorDict:
                     entry = _BunsetsuEntry(word, "verb", "", logfreq)
                     self._entries.append(entry)
                     self._by_particle[""].append(entry)
-                    self._by_pos.setdefault("verb", []).append(entry)
                     counts["verb"] += 1
                 past = _conjugate_past(word, conj_type)
                 if past and past[-1] in _VERB_PAST_TAILS:
                     entry = _BunsetsuEntry(past, "verb", "", logfreq)
                     self._entries.append(entry)
                     self._by_particle[""].append(entry)
-                    self._by_pos.setdefault("verb", []).append(entry)
                     counts["verb"] += 1
 
             elif first_pos == "形容詞":
@@ -867,13 +800,11 @@ class JapaneseDistractorDict:
                     entry = _BunsetsuEntry(word, "adj", "", logfreq)
                     self._entries.append(entry)
                     self._by_particle[""].append(entry)
-                    self._by_pos.setdefault("adj", []).append(entry)
                     counts["adj"] += 1
                 if word and word.endswith("い"):
                     entry = _BunsetsuEntry(word[:-1] + "かった", "adj", "", logfreq)
                     self._entries.append(entry)
                     self._by_particle[""].append(entry)
-                    self._by_pos.setdefault("adj", []).append(entry)
                     counts["adj"] += 1
 
             elif first_pos == "形容動詞":
@@ -883,14 +814,12 @@ class JapaneseDistractorDict:
                         entry = _BunsetsuEntry(na_text, "adj", "", logfreq)
                         self._entries.append(entry)
                         self._by_particle[""].append(entry)
-                        self._by_pos.setdefault("adj", []).append(entry)
                         counts["adj"] += 1
 
             elif first_pos == "副詞":
                 entry = _BunsetsuEntry(word, "adv", "", logfreq)
                 self._entries.append(entry)
                 self._by_particle[""].append(entry)
-                self._by_pos.setdefault("adv", []).append(entry)
 
         self._build_freq_bins()
 
@@ -906,7 +835,6 @@ class JapaneseDistractorDict:
                 pickle.dump({
                     "entries": self._entries,
                     "by_particle": self._by_particle,
-                    "by_pos": self._by_pos,
                     "by_freq_bin": self._by_freq_bin,
                 }, f, protocol=pickle.HIGHEST_PROTOCOL)
             print(f"  cached → {os.path.basename(cache_path)}")
@@ -932,7 +860,6 @@ class JapaneseDistractorDict:
     def get_violating_distractors(
         self,
         prior_particles: List[str],
-        is_final: bool,
         target_pos: str,
         min_length: int,
         max_length: int,
@@ -940,55 +867,53 @@ class JapaneseDistractorDict:
         banned: Optional[List[str]] = None,
         target_freq: float = 0.0,
     ) -> List[tuple]:
-        """Return (bunsetsu, tier) pairs that create grammatical violations.
+        """Return (bunsetsu, tier, freq) triples to be re-ranked by surprisal.
 
-        Tiers (lower = stronger, more preferred):
-          1  Strong duplicate particle (が, を) — categorical
-          2  Weak duplicate particle (に, で, は) / POS mismatch
-        No tier-3 fallback: positions with no tier-1/2 candidate emit x-x-x.
+        Strategy A (nominal slots): inject noun stems carrying a structurally
+            improbable particle (duplicate of a prior particle, or が/は after
+            any prior particle).  Tier 1 if duplicates a strong (が/を), else 2.
+        Strategy B: POS mismatch — distractor's POS differs from the slot's POS.
+            With disable_noun_in_verb_slot=True (default), noun+particle entries
+            are NOT injected into verb slots.
         """
         banned_set = frozenset(banned) if banned else frozenset()
         n = params.get("num_to_test", 80)
+        disable_n_in_v = params.get("disable_noun_in_verb_slot", True)
         freq_entries = self._freq_bin_entries(target_freq)
 
         seen: set = set()
-        tier1: List[tuple] = []
-        rest:  List[tuple] = []
+        results: List[tuple] = []
 
         def _ok(e: _BunsetsuEntry) -> bool:
-            # Adverbs are too syntactically flexible to be strong distractors
-            # in Japanese — they can float into almost any slot without
-            # producing a clean violation.  Exclude globally.
             if e.pos == "adv":
                 return False
             return (min_length <= e.length <= max_length
                     and e.text not in banned_set
                     and e.text not in seen)
 
-        # Tier 1: strong duplicate particles only (が, を).
-        used_strong = [p for p in prior_particles if p in _STRONG_DUPLICATE_PARTICLES]
-        if used_strong:
+        # Strategy depends on the target slot's POS.
+        is_nominal = target_pos in ("noun", "other")
+        if is_nominal:
+            # Strategy A: noun stems with a structurally improbable particle.
+            improbable = _improbable_particles_for_position(prior_particles)
             for e in freq_entries:
-                if e.particle in used_strong and _ok(e):
-                    tier1.append((e.text, 1))
+                if e.pos == "noun" and e.particle in improbable and _ok(e):
+                    tier = (1 if (e.particle in _STRONG_DUPLICATE_PARTICLES
+                                  and e.particle in prior_particles) else 2)
+                    results.append((e.text, tier, e.freq))
                     seen.add(e.text)
-
-        # Only fall through to weaker strategies if tier 1 is sparse.
-        if len(tier1) < max(n // 2, 15):
-            # Tier 2a: weak duplicate particles (に, で, は).
-            used_weak = [p for p in prior_particles
-                         if p in _CASE_PARTICLES and p not in _STRONG_DUPLICATE_PARTICLES]
-            if used_weak:
-                for e in freq_entries:
-                    if e.particle in used_weak and _ok(e):
-                        rest.append((e.text, 2))
-                        seen.add(e.text)
-
-            # Tier 2b: any POS mismatch — covers verb/noun/adj/other slots.
+        else:
+            # Strategy B: POS mismatch (verb/adj/adv slots).  Skip noun+particle
+            # entries in verb slots when disable_noun_in_verb_slot is set.
             for e in freq_entries:
-                if e.pos != target_pos and _ok(e):
-                    rest.append((e.text, 2))
-                    seen.add(e.text)
+                if e.pos == target_pos:
+                    continue
+                if disable_n_in_v and target_pos == "verb" and e.particle:
+                    continue
+                if not _ok(e):
+                    continue
+                results.append((e.text, 2, e.freq))
+                seen.add(e.text)
 
         def _safe(text: str) -> bool:
             if _SMALL_KANA_START.match(text):
@@ -998,9 +923,8 @@ class JapaneseDistractorDict:
                 return False
             return stem not in _BLOCKED_WORDS and text not in _BLOCKED_WORDS
 
-        random.shuffle(tier1)
-        random.shuffle(rest)
-        pool = [(t, r) for t, r in tier1 + rest if _safe(t)]
+        random.shuffle(results)
+        pool = [c for c in results if _safe(c[0])]
         return pool[:n]
 
 
@@ -1033,8 +957,6 @@ class Sentence:
         self.tag = tag
         self.distractors: List[str] = ["x-x-x"]   # first position always x-x-x
         self.distractor_sentence: str = ""
-        self.probs: Dict = {}        # label → prefix context (token IDs)
-        self.surprisal: Dict = {}    # label → surprisal (bits)
 
     @property
     def word_sentence(self) -> str:
@@ -1044,48 +966,28 @@ class Sentence:
     def label_sentence(self) -> str:
         return " ".join(str(l) for l in self.labels)
 
-    def do_model(self, model: JapaneseGPT2LM):
-        """Build prefix contexts for each label position."""
-        state = model.empty_sentence()
-        for i in range(len(self.words) - 1):
-            self.probs[self.labels[i + 1]] = state
-            state = model.update(state, self.words[i])
-
-    def do_surprisal(self, model: JapaneseGPT2LM):
-        """Compute surprisal of each real word given its prefix."""
-        for i in range(1, len(self.labels)):
-            lab = self.labels[i]
-            self.surprisal[lab] = model.get_surprisal(self.probs[lab], self.words[i])
-
 
 class Label:
     """Aggregated data for one label position across all sentences of an item."""
-
-    _LM_WAVE_SIZE = 16
-    _HEURISTIC_ACCEPT = 3
 
     def __init__(self, item_id: str, lab):
         self.id = item_id
         self.lab = lab
         self.words: List[str] = []
-        self.probs: List[tuple] = []
-        self.surprisals: List[float] = []
+        self.prefixes: List[str] = []  # raw text prefix per sentence in this item
         self.distractor: str = "x-x-x"
 
-    def add_sentence(self, word: str, context_ids: tuple, surprisal: float):
-        """Register a sentence's word/context/surprisal for this label."""
+    def add_sentence(self, word: str, prefix: str = ""):
         self.words.append(word)
-        self.probs.append(context_ids)
-        self.surprisals.append(surprisal)
+        self.prefixes.append(prefix)
 
     def choose_distractor(
         self,
-        model: JapaneseGPT2LM,
-        dist_dict: JapaneseDistractorDict,
+        model: "Optional[JapaneseGPT2LM]",
+        dist_dict: "JapaneseDistractorDict",
         params: Dict,
         banned: List[str],
         prior_particles: List[str],
-        is_final: bool,
         target_pos: str,
     ) -> str:
         """Select the best distractor for this label position."""
@@ -1097,30 +999,16 @@ class Label:
         min_len = max(1, min(lengths) - 1)
         max_len = max(lengths) + 3
 
-        _stems = [RepeatCounter._extract_stem(w) for w in self.words]
-        _freqs = [get_frequency_ja(s) for s in _stems if s]
-        _freqs = [f for f in _freqs if f > -15.0]
-        target_freq = sum(_freqs) / len(_freqs) if _freqs else 10.0
+        stems = [RepeatCounter._extract_stem(w) for w in self.words]
+        known = [f for f in (get_frequency_ja(s) for s in stems if s) if f > -15.0]
+        target_freq = sum(known) / len(known) if known else 10.0
 
         candidates = dist_dict.get_violating_distractors(
-            prior_particles, is_final, target_pos,
+            prior_particles, target_pos,
             min_len, max_len, params, banned,
             target_freq=target_freq,
         )
-
-        banned_set = frozenset(banned)
-        cand_pairs = [(c, tier) for c, tier in candidates if c not in banned_set]
-
-        # Sort tier-first (stronger violations before weaker), then by
-        # freq proximity with jitter and katakana bonus within each tier.
-        cand_pairs.sort(key=lambda ct: (
-            ct[1],
-            abs(get_frequency_ja(ct[0]) - target_freq)
-            + random.random() * 0.05
-            + (_KATAKANA_BONUS if _is_katakana_heavy(ct[0]) else 0.0)
-        ))
-        cand_list = [c for c, _ in cand_pairs]
-        if not cand_list:
+        if not candidates:
             self.distractor = "x-x-x"
             return "x-x-x"
 
@@ -1131,89 +1019,64 @@ class Label:
                 target_punct = m.group()
                 break
 
-        def _apply_punct(word: str) -> str:
-            if target_punct and not _PUNCT_FINAL.search(word):
-                return word + target_punct
-            return word
+        cand_texts = [c[0] for c in candidates]
+        cand_freq  = [c[2] for c in candidates]
+        cand_tier  = [c[1] for c in candidates]
+        n_cand = len(candidates)
 
-        for cand in cand_list:
-            if abs(get_frequency_ja(cand) - target_freq) <= 1.5:
-                self.distractor = _apply_punct(cand)
-                return self.distractor
+        use_lm = (model is not None
+                  and params.get("use_lm", True)
+                  and self.prefixes and any(self.prefixes))
 
-        if cand_list:
-            self.distractor = _apply_punct(cand_list[0])
-            return self.distractor
+        if use_lm:
+            # Min surprisal across all sentences sharing this label.
+            min_surp = [float("inf")] * n_cand
+            for prefix in self.prefixes:
+                if not prefix:
+                    continue
+                pids = model.encode_prefix(prefix)
+                row = model.get_surprisals(pids, cand_texts)
+                for i, s in enumerate(row):
+                    if s < min_surp[i]:
+                        min_surp[i] = s
 
-        _TOP_K_PICK = 5
-        min_pmi       = params["min_pmi"]
-        min_abs_floor = params["min_abs"]
-        best_word     = "x-x-x"
-        best_min_pmi  = -float("inf")
-        wave          = self._LM_WAVE_SIZE
-        passed: List[str] = []
+            ceiling   = params.get("surprisal_ceiling", 35.0)
+            min_floor = params.get("min_surprisal", 14.0)
+            band      = params.get("freq_match_band", 2.0)
 
-        for start in range(0, len(cand_list), wave):
-            batch = cand_list[start : start + wave]
+            # Score: prefer (in-freq-band, surprisal in (min_floor, ceiling), strong tier).
+            scored = []
+            for i in range(n_cand):
+                s = min_surp[i]
+                if s == float("inf") or s > ceiling or s < min_floor:
+                    continue
+                in_band = abs(cand_freq[i] - target_freq) <= band
+                scored.append((cand_texts[i], s, cand_tier[i], in_band))
 
-            penalties = [
-                _BORING_PENALTY if RepeatCounter._extract_stem(c) in _BORING_WORDS
-                else 0.0
-                for c in batch
-            ]
-            uni_bits     = [_unigram_bits(get_frequency_ja(c)) for c in batch]
-            min_pmi_seen = [float("inf")] * len(batch)
-            alive = list(range(len(batch)))
+            if scored:
+                # Sort: in-band first, then highest surprisal, then strongest tier.
+                scored.sort(key=lambda x: (not x[3], -x[1], x[2]))
+                chosen = scored[0][0]
+            else:
+                # Nothing passed the surprisal gate — emit x-x-x to keep quality high.
+                self.distractor = "x-x-x"
+                return "x-x-x"
+        else:
+            # No LM: fall back to tier + freq proximity.
+            order = sorted(range(n_cand), key=lambda i: (
+                cand_tier[i],
+                abs(cand_freq[i] - target_freq) + random.random() * 0.05,
+            ))
+            chosen = cand_texts[order[0]]
 
-            for ctx in self.probs:
-                if not alive:
-                    break
-                alive_batch = [batch[i] for i in alive]
-                row = model.get_surprisals_batch(ctx, alive_batch)
-
-                next_alive: List[int] = []
-                for local_idx, orig_idx in enumerate(alive):
-                    s   = row[local_idx]
-                    pmi = s - uni_bits[orig_idx]
-                    if pmi < min_pmi_seen[orig_idx]:
-                        min_pmi_seen[orig_idx] = pmi
-                    if s > _SURPRISAL_CEILING:
-                        continue                         # gibberish
-                    if pmi < min_pmi + penalties[orig_idx]:
-                        continue                         # context too weak
-                    if s < min_abs_floor:
-                        continue                         # absolute backstop
-                    next_alive.append(orig_idx)
-                alive = next_alive
-
-            for orig_idx in alive:
-                passed.append(batch[orig_idx])
-                if len(passed) >= _TOP_K_PICK:
-                    break
-
-            for orig_idx, mp in enumerate(min_pmi_seen):
-                if mp != float("inf") and mp > best_min_pmi:
-                    best_min_pmi = mp
-                    best_word = batch[orig_idx]
-
-            if len(passed) >= _TOP_K_PICK:
-                break
-
-        if passed:
-            chosen = random.choice(passed)
-            self.distractor = _apply_punct(chosen)
-            return self.distractor
-
-        logging.warning(
-            "PMI threshold not met for %s/%s; best='%s' (PMI=%.1f bits)",
-            self.id, self.lab, best_word, best_min_pmi,
-        )
-        self.distractor = _apply_punct(best_word)
-        return self.distractor
+        if target_punct and not _PUNCT_FINAL.search(chosen):
+            chosen += target_punct
+        self.distractor = chosen
+        return chosen
 
 
 class SentenceSet:
-    """All sentences sharing one item ID.  Owns label aggregation and"""
+    """All sentences sharing one item ID; owns label aggregation and distractor selection."""
 
     def __init__(self, item_id: str):
         self.id = item_id
@@ -1230,31 +1093,20 @@ class SentenceSet:
         if self.first_labels & self.label_ids:
             raise ValueError(f"Item {self.id}: overlap in first/later labels.")
 
-    def do_model(self, model: JapaneseGPT2LM):
-        """Build prefix contexts for every sentence."""
-        for s in self.sentences:
-            s.do_model(model)
-
-    def do_surprisals(self, model: JapaneseGPT2LM):
-        """Compute real-word surprisals for every sentence."""
-        for s in self.sentences:
-            s.do_surprisal(model)
-
     def make_labels(self):
         """Create Label objects and aggregate cross-sentence data."""
         for lab in self.label_ids:
             self.labels[lab] = Label(self.id, lab)
         for s in self.sentences:
             for i in range(1, len(s.labels)):
-                lab = s.labels[i]
-                self.labels[lab].add_sentence(
-                    s.words[i], s.probs[lab], s.surprisal[lab]
-                )
+                # prefix = original sentence text up to (not including) this position
+                prefix = "".join(s.words[:i])
+                self.labels[s.labels[i]].add_sentence(s.words[i], prefix)
 
     def do_distractors(
         self,
-        model: JapaneseGPT2LM,
-        dist_dict: JapaneseDistractorDict,
+        model: "Optional[JapaneseGPT2LM]",
+        dist_dict: "JapaneseDistractorDict",
         tokenizer: "Optional[JapaneseTokenizer]",
         params: Dict,
         repeats: "RepeatCounter",
@@ -1270,17 +1122,18 @@ class SentenceSet:
                 lab = first.labels[i]
                 info = tokenizer.get_bunsetsu_info(w)
 
-                if info["pos"] in ("verb", "adj") and i < len(first.words) - 1:
+                # Reset particle accumulation at a clause-ending verb only.
+                # Attributive adjectives (難しい問題) remain in the same clause.
+                if info["pos"] == "verb" and i < len(first.words) - 1:
                     running_particles = []
 
                 if lab in self.label_ids:
                     label_ctx[lab] = {
                         "prior": list(running_particles),
-                        "is_final": (i == len(first.words) - 1),
                         "pos": info["pos"],
                     }
                 p = info["particle"]
-                for cp in sorted(_ALL_PARTICLES, key=len, reverse=True):
+                for cp in _ALL_PARTICLES_SORTED:
                     if p.startswith(cp):
                         running_particles.append(cp)
                         break
@@ -1293,7 +1146,6 @@ class SentenceSet:
                 model, dist_dict, params,
                 banned + list(sentence_banned),
                 prior_particles=ctx.get("prior", []),
-                is_final=ctx.get("is_final", False),
                 target_pos=ctx.get("pos", "other"),
             )
             stem = RepeatCounter._extract_stem(dist)
@@ -1307,15 +1159,12 @@ class SentenceSet:
 
         for s in self.sentences:
             for i in range(1, len(s.labels)):
-                lab = s.labels[i]
-                s.distractors.append(self.labels[lab].distractor)
+                s.distractors.append(self.labels[s.labels[i]].distractor)
             s.distractor_sentence = " ".join(s.distractors)
 
     def clean_up(self):
         """Free memory after distractor selection is complete."""
         self.labels = {}
-        for s in self.sentences:
-            s.probs = {}
 
 
 class RepeatCounter:
@@ -1334,7 +1183,7 @@ class RepeatCounter:
         w = word
         while w and w[-1] in "。！？":
             w = w[:-1]
-        for p in sorted(_CASE_PARTICLES, key=len, reverse=True):
+        for p in _CASE_PARTICLES_SORTED:
             if w.endswith(p) and len(w) > len(p):
                 return w[:-len(p)]
         return w
@@ -1447,22 +1296,23 @@ def run_maze_japanese(
     outformat: str = "delim",
     seed: Optional[int] = None,
 ):
-    """End-to-end pipeline: load → model → distractors → write → report."""
+    """End-to-end pipeline: load → distractors → write → report."""
     if outformat not in ("delim", "ibex"):
         raise ValueError(f"Unknown format: {outformat!r}")
 
     if seed is not None:
         random.seed(seed)
-        torch.manual_seed(seed)
-        if torch.cuda.is_available():
-            torch.cuda.manual_seed_all(seed)
         print(f"Random seed set to {seed}")
 
     params    = load_params(params_file)
     tokenizer = JapaneseTokenizer() if _FUGASHI_AVAILABLE else None
-    lm        = JapaneseGPT2LM(params.get("model_name", DEFAULT_MODEL_NAME))
     dist_dict = JapaneseDistractorDict(params, tokenizer=tokenizer)
     repeats   = RepeatCounter(params.get("max_repeat", 0))
+    model = None
+    if params.get("use_lm", True) and _LM_AVAILABLE:
+        model = JapaneseGPT2LM(params.get("model_name", DEFAULT_MODEL_NAME))
+    elif params.get("use_lm", True):
+        print("WARNING: use_lm=True but torch/transformers not installed; falling back.")
 
     print("Reading input...")
     all_sets = read_input(infile, tokenizer)
@@ -1471,12 +1321,14 @@ def run_maze_japanese(
     print(f"  {n_sents} sentences across {n_items} items")
 
     t_start = time.time()
+    all_distractors: List[str] = []
     for idx, (item_id, ss) in enumerate(all_sets.items(), 1):
         print(f"  [{idx}/{n_items}] item {item_id}")
-        ss.do_model(lm)
-        ss.do_surprisals(lm)
         ss.make_labels()
-        ss.do_distractors(lm, dist_dict, tokenizer, params, repeats)
+        ss.do_distractors(model, dist_dict, tokenizer, params, repeats)
+        for lab in ss.labels.values():
+            if lab.distractor and lab.distractor != "x-x-x":
+                all_distractors.append(lab.distractor)
         ss.clean_up()
     t_elapsed = time.time() - t_start
 
@@ -1486,15 +1338,9 @@ def run_maze_japanese(
     else:
         save_delim(outfile, all_sets)
 
-    all_distractors = []
-    for ss in all_sets.values():
-        for lab in ss.labels.values():
-            if lab.distractor and lab.distractor != "x-x-x":
-                all_distractors.append(lab.distractor)
     n_dist = len(all_distractors)
     n_unique = len(set(all_distractors))
-    stems = [RepeatCounter._extract_stem(d) for d in all_distractors]
-    n_unique_stems = len(set(stems))
+    n_unique_stems = len({RepeatCounter._extract_stem(d) for d in all_distractors})
     katakana_count = sum(1 for d in all_distractors if _is_katakana_heavy(d))
 
     print(f"\n{'─' * 50}")
@@ -1514,7 +1360,7 @@ def _val_particle(word: str) -> str:
     w = word
     while w and w[-1] in "。！？":
         w = w[:-1]
-    for p in sorted(_CASE_PARTICLES, key=len, reverse=True):
+    for p in _CASE_PARTICLES_SORTED:
         if w.endswith(p) and len(w) > len(p):
             return p
     return ""
@@ -1526,6 +1372,8 @@ def _val_pos(word: str) -> str:
         return "noun_particle"
     if not stem:
         return "other"
+    if stem.endswith("かった"):
+        return "adj"  # past i-adjective (e.g. 細かかった)
     last = stem[-1]
     if last in "ただ" and len(stem) >= 2:
         return "verb"
@@ -1540,8 +1388,13 @@ def _val_classify(word: str, distractor: str, prior_words: List[str]) -> str:
     d_p = _val_particle(distractor)
     w_pos, d_pos = _val_pos(word), _val_pos(distractor)
     priors = {_val_particle(w) for w in prior_words} - {""}
-    if d_p and d_p in priors:
-        return "STRONG" if d_p in _STRONG_DUPLICATE_PARTICLES else "MEDIUM"
+    # STRONG: duplicate of prior が or を
+    if d_p in priors and d_p in _STRONG_DUPLICATE_PARTICLES:
+        return "STRONG"
+    # MEDIUM: weak duplicate (に/で/は), or が/は added when priors exist (improbable)
+    if d_p and (d_p in priors or (d_p in {"が", "は"} and priors)):
+        return "MEDIUM"
+    # MEDIUM: POS mismatch
     if w_pos != d_pos and w_pos != "other" and d_pos != "other":
         return "MEDIUM"
     if w_pos == d_pos:
@@ -1688,7 +1541,6 @@ def _cli():
         target = args.output or args.input
         if not target:
             ap.error("--validate requires a file argument")
-        import sys
         sys.exit(validate_output(target, verbose=args.verbose))
     if not args.output:
         ap.error("output file required")
