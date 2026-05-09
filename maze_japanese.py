@@ -53,11 +53,10 @@ DEFAULT_PARAMS: Dict = {
     "min_surprisal":  14.0,    # bits — distractor must surprise the LM by ≥ this
     "surprisal_ceiling": 35.0, # bits — above this means LM-OOV (unreliable)
     "freq_match_band": 2.0,    # log-freq tolerance vs target_freq
-    "disable_noun_in_verb_slot": True,  # don't inject noun+particle into verb slots
 }
 
 
-_POOL_CACHE_VERSION = 20
+_POOL_CACHE_VERSION = 21
 
 
 _FREQ_BIN_WIDTH  = 0.1   # log-freq units per bin
@@ -97,7 +96,7 @@ _ALL_PARTICLES_SORTED = sorted(_ALL_PARTICLES, key=len, reverse=True)
 
 
 _CONTENT_POS = frozenset({
-    "名詞", "動詞", "形容詞", "形容動詞", "副詞",
+    "名詞", "動詞", "形容詞", "形容動詞", "形状詞", "副詞",
     "連体詞", "接続詞", "感動詞", "接頭詞", "接頭辞",
 })
 
@@ -244,8 +243,22 @@ _MORPHOLOGICAL_BLOCKED = {
     "もん",   # spoken もの — too casual for experimental stimuli
 }
 
+# Dark / morbid content — keep stimuli emotionally neutral.
+_DARK_BLOCKED = {
+    "死", "死亡", "死者", "死体", "死刑", "死後", "死神",
+    "殺", "殺人", "殺害", "自殺", "他殺", "毒殺", "暗殺",
+    "事故", "災害", "災難", "犠牲", "犠牲者",
+    "病死", "病気", "重病", "末期", "癌", "がん",
+    "戦死", "戦争", "戦死者", "戦闘", "戦犯",
+    "遺体", "遺骨", "遺族", "遺書", "葬式", "葬儀",
+    "拷問", "虐待", "虐殺", "暴行", "強姦",
+    "首吊り", "縊死", "焼死", "凍死", "餓死", "溺死",
+    "犯罪", "犯人", "容疑", "容疑者", "犯行",
+    "テロ", "爆発", "爆弾", "銃", "刃物",
+}
+
 _BLOCKED_WORDS = frozenset(
-    _EXTERNAL_BLOCKED | _SUPPLEMENT_BLOCKED | _MORPHOLOGICAL_BLOCKED
+    _EXTERNAL_BLOCKED | _SUPPLEMENT_BLOCKED | _MORPHOLOGICAL_BLOCKED | _DARK_BLOCKED
 )
 
 
@@ -507,7 +520,7 @@ class JapaneseTokenizer:
             return {"pos": "other", "particle": ""}
 
         has_verb = any(self._pos(m) == "動詞" for m in morphemes)
-        has_adj  = any(self._pos(m) in ("形容詞", "形容動詞") for m in morphemes)
+        has_adj  = any(self._pos(m) in ("形容詞", "形容動詞", "形状詞") for m in morphemes)
 
         if has_verb:
             first_content_pos = "verb"
@@ -623,6 +636,24 @@ class JapaneseGPT2LM:
                     total += -log_probs[j, plen - 1 + t, toks[t]].item()
                 results[i] = total * self._inv_ln2
         return results
+
+
+_KATAKANA_ONLY_RE = re.compile(r'^[ァ-ヶー]+$')
+
+
+def _looks_like_loanword_name(text: str) -> bool:
+    """Heuristic: pure-katakana stems of length ≥4 are likely transliterated
+    proper nouns (リチャード, ダイアナ, アンドレアス) — exclude as distractors
+    to avoid jarring cultural-register clashes in everyday Japanese stimuli.
+    Strips trailing case particles before measuring."""
+    stem = text
+    while stem and stem[-1] in "。！？":
+        stem = stem[:-1]
+    for p in _CASE_PARTICLES_SORTED:
+        if stem.endswith(p) and len(stem) > len(p):
+            stem = stem[:-len(p)]
+            break
+    return len(stem) >= 4 and bool(_KATAKANA_ONLY_RE.match(stem))
 
 
 def _improbable_particles_for_position(prior_particles: List[str]) -> set:
@@ -807,7 +838,7 @@ class JapaneseDistractorDict:
                     self._by_particle[""].append(entry)
                     counts["adj"] += 1
 
-            elif first_pos == "形容動詞":
+            elif first_pos in ("形容動詞", "形状詞"):
                 for suffix in ("だ", "だった"):
                     na_text = word + suffix
                     if not _SMALL_KANA_START.match(na_text):
@@ -866,35 +897,63 @@ class JapaneseDistractorDict:
         params: Dict,
         banned: Optional[List[str]] = None,
         target_freq: float = 0.0,
+        is_final: bool = False,
+        prev_particle: str = "",
     ) -> List[tuple]:
         """Return (bunsetsu, tier, freq) triples to be re-ranked by surprisal.
 
-        Strategy A (nominal slots): inject noun stems carrying a structurally
-            improbable particle (duplicate of a prior particle, or が/は after
-            any prior particle).  Tier 1 if duplicates a strong (が/を), else 2.
-        Strategy B: POS mismatch — distractor's POS differs from the slot's POS.
-            With disable_noun_in_verb_slot=True (default), noun+particle entries
-            are NOT injected into verb slots.
+        Strategy:
+          (1) BAN: if the immediately preceding bunsetsu's particle is が or は,
+              verb / adjective distractors are forbidden — they would read as a
+              relative clause or attributive modifier of a following noun (e.g.
+              "学生は 信じる 本を" parses as "the book the student believes").
+          (2) Sentence-final slot (and not under the BAN): use verb or adjective
+              distractors so the sentence still ends with a predicate, but the
+              predicate is contextually wrong / semantically implausible / takes
+              the wrong argument structure relative to the priors.
+          (3) Adj/adv slot (and not under the BAN): verb intrusion — a finite
+              verb where an attributive / adverbial element was expected breaks
+              the modification structure.
+          (4) Nominal (noun/other) and non-final verb slot: noun stems with a
+              structurally improbable particle (duplicate, or が/は after any
+              prior particle).
+          (5) Adj/adv slot under the BAN: emit nothing (x-x-x).
+          (6) Final slot under the BAN: fall through to (4) — noun+improbable.
         """
         banned_set = frozenset(banned) if banned else frozenset()
         n = params.get("num_to_test", 80)
-        disable_n_in_v = params.get("disable_noun_in_verb_slot", True)
         freq_entries = self._freq_bin_entries(target_freq)
 
         seen: set = set()
         results: List[tuple] = []
+        ga_or_wa_prev = prev_particle in ("が", "は")
 
         def _ok(e: _BunsetsuEntry) -> bool:
             if e.pos == "adv":
+                return False
+            if _looks_like_loanword_name(e.text):
                 return False
             return (min_length <= e.length <= max_length
                     and e.text not in banned_set
                     and e.text not in seen)
 
-        # Strategy depends on the target slot's POS.
-        is_nominal = target_pos in ("noun", "other")
-        if is_nominal:
-            # Strategy A: noun stems with a structurally improbable particle.
+        if is_final and not ga_or_wa_prev:
+            # Sentence-final slot: verb or adjective distractor.
+            for e in freq_entries:
+                if e.pos in ("verb", "adj") and _ok(e):
+                    results.append((e.text, 2, e.freq))
+                    seen.add(e.text)
+        elif target_pos in ("adj", "adv"):
+            if ga_or_wa_prev:
+                pass  # BAN — emit no candidates → x-x-x
+            else:
+                # Verb intrusion in adj/adv slot.
+                for e in freq_entries:
+                    if e.pos == "verb" and _ok(e):
+                        results.append((e.text, 2, e.freq))
+                        seen.add(e.text)
+        else:
+            # Nominal / non-final verb / final-after-が・は: noun + improbable particle.
             improbable = _improbable_particles_for_position(prior_particles)
             for e in freq_entries:
                 if e.pos == "noun" and e.particle in improbable and _ok(e):
@@ -902,17 +961,6 @@ class JapaneseDistractorDict:
                                   and e.particle in prior_particles) else 2)
                     results.append((e.text, tier, e.freq))
                     seen.add(e.text)
-        else:
-            # Strategy B: POS mismatch (verb/adj/adv slots).  Skip noun+particle
-            # entries in verb slots when disable_noun_in_verb_slot is set.
-            for e in freq_entries:
-                if e.pos == target_pos:
-                    continue
-                if disable_n_in_v and target_pos == "verb" and e.particle:
-                    continue
-                if not _ok(e):
-                    continue
-                results.append((e.text, 2, e.freq))
                 seen.add(e.text)
 
         def _safe(text: str) -> bool:
@@ -989,6 +1037,8 @@ class Label:
         banned: List[str],
         prior_particles: List[str],
         target_pos: str,
+        is_final: bool = False,
+        prev_particle: str = "",
     ) -> str:
         """Select the best distractor for this label position."""
         if all(not _JP_RE.search(w) for w in self.words):
@@ -1007,6 +1057,8 @@ class Label:
             prior_particles, target_pos,
             min_len, max_len, params, banned,
             target_freq=target_freq,
+            is_final=is_final,
+            prev_particle=prev_particle,
         )
         if not candidates:
             self.distractor = "x-x-x"
@@ -1118,25 +1170,32 @@ class SentenceSet:
         label_ctx: Dict = {}
         if first and tokenizer:
             running_particles: List[str] = []
+            prev_particle = ""
+            n_words = len(first.words)
             for i, w in enumerate(first.words):
                 lab = first.labels[i]
                 info = tokenizer.get_bunsetsu_info(w)
 
                 # Reset particle accumulation at a clause-ending verb only.
                 # Attributive adjectives (難しい問題) remain in the same clause.
-                if info["pos"] == "verb" and i < len(first.words) - 1:
+                if info["pos"] == "verb" and i < n_words - 1:
                     running_particles = []
 
                 if lab in self.label_ids:
                     label_ctx[lab] = {
                         "prior": list(running_particles),
                         "pos": info["pos"],
+                        "is_final": (i == n_words - 1),
+                        "prev_particle": prev_particle,
                     }
                 p = info["particle"]
+                matched = ""
                 for cp in _ALL_PARTICLES_SORTED:
                     if p.startswith(cp):
                         running_particles.append(cp)
+                        matched = cp
                         break
+                prev_particle = matched
 
         sentence_banned: set = set()
 
@@ -1147,6 +1206,8 @@ class SentenceSet:
                 banned + list(sentence_banned),
                 prior_particles=ctx.get("prior", []),
                 target_pos=ctx.get("pos", "other"),
+                is_final=ctx.get("is_final", False),
+                prev_particle=ctx.get("prev_particle", ""),
             )
             stem = RepeatCounter._extract_stem(dist)
             sentence_banned.add(dist)
@@ -1372,8 +1433,12 @@ def _val_pos(word: str) -> str:
         return "noun_particle"
     if not stem:
         return "other"
-    if stem.endswith("かった"):
+    if stem.endswith("かった") or stem.endswith("くなかった"):
         return "adj"  # past i-adjective (e.g. 細かかった)
+    if stem.endswith("だった") or stem.endswith("じゃなかった"):
+        return "adj"  # past na-adjective (e.g. シンプルだった)
+    if stem.endswith("だ") and len(stem) >= 3:
+        return "adj"  # plain na-adjective predicative (シンプルだ)
     last = stem[-1]
     if last in "ただ" and len(stem) >= 2:
         return "verb"
