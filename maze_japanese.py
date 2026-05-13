@@ -1176,9 +1176,14 @@ class SentenceSet:
                 lab = first.labels[i]
                 info = tokenizer.get_bunsetsu_info(w)
 
-                # Reset particle accumulation at a clause-ending verb only.
-                # Attributive adjectives (難しい問題) remain in the same clause.
-                if info["pos"] == "verb" and i < n_words - 1:
+                # Reset particle accumulation only at a true clause boundary —
+                # a bunsetsu ending with sentence-final punctuation (。！？).
+                # Embedded verbs (te-form, participial, periphrastic) within a
+                # complex sentence do NOT reset, so subsequent slots can still
+                # see earlier particles as candidates for the improbable-particle
+                # rule.  Without this, complex sentences accumulate many slots
+                # with empty priors and yield x-x-x.
+                if w.rstrip().endswith(("。", "！", "？")) and i < n_words - 1:
                     running_particles = []
 
                 if lab in self.label_ids:
