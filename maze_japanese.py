@@ -5,6 +5,8 @@ Usage:
     python maze_japanese.py --validate output.txt [-v]
 """
 
+__version__ = "0.9.0"
+
 
 import argparse
 import ast
@@ -976,6 +978,54 @@ class JapaneseDistractorDict:
         return pool[:n]
 
 
+    def get_relaxed_distractors(
+        self,
+        target_pos: str,
+        min_length: int,
+        max_length: int,
+        params: Dict,
+        banned: Optional[List[str]] = None,
+        target_freq: float = 0.0,
+    ) -> List[tuple]:
+        """Fallback pool — any compatible candidate, no improbable-particle rule.
+
+        Used only when get_violating_distractors returns nothing.  Prefers
+        POS-mismatched entries (tier 3) over same-POS (tier 4).  The result is
+        marked with an asterisk by the caller so reviewers know it bypassed the
+        strict rules.
+        """
+        banned_set = frozenset(banned) if banned else frozenset()
+        n = params.get("num_to_test", 80)
+        freq_entries = self._freq_bin_entries(target_freq)
+        seen: set = set()
+        results: List[tuple] = []
+
+        for e in freq_entries:
+            if e.pos == "adv":
+                continue
+            if _looks_like_loanword_name(e.text):
+                continue
+            if not (min_length <= e.length <= max_length):
+                continue
+            if e.text in banned_set or e.text in seen:
+                continue
+            tier = 3 if e.pos != target_pos else 4
+            results.append((e.text, tier, e.freq))
+            seen.add(e.text)
+
+        def _safe(text: str) -> bool:
+            if _SMALL_KANA_START.match(text):
+                return False
+            stem = RepeatCounter._extract_stem(text)
+            if _SMALL_TSU_END.search(stem):
+                return False
+            return stem not in _BLOCKED_WORDS and text not in _BLOCKED_WORDS
+
+        random.shuffle(results)
+        pool = [c for c in results if _safe(c[0])]
+        return pool[:n]
+
+
 _JA_FREQ_DICT: Dict[str, float] = {}
 
 
@@ -1060,9 +1110,19 @@ class Label:
             is_final=is_final,
             prev_particle=prev_particle,
         )
+        is_fallback = False
         if not candidates:
-            self.distractor = "x-x-x"
-            return "x-x-x"
+            # Strict rules produced nothing — try the relaxed pool.  Any
+            # candidate emitted from here gets an asterisk so reviewers know
+            # it bypassed the improbable-particle / BAN constraints.
+            candidates = dist_dict.get_relaxed_distractors(
+                target_pos, min_len, max_len, params, banned,
+                target_freq=target_freq,
+            )
+            is_fallback = True
+            if not candidates:
+                self.distractor = "x-x-x"
+                return "x-x-x"
 
         target_punct = ""
         for w in self.words:
@@ -1110,9 +1170,17 @@ class Label:
                 scored.sort(key=lambda x: (not x[3], -x[1], x[2]))
                 chosen = scored[0][0]
             else:
-                # Nothing passed the surprisal gate — emit x-x-x to keep quality high.
-                self.distractor = "x-x-x"
-                return "x-x-x"
+                # Nothing passed the surprisal gate — pick the candidate with the
+                # highest in-range surprisal anyway, marked as a fallback.
+                viable = [(i, min_surp[i]) for i in range(n_cand)
+                          if min_surp[i] != float("inf") and min_surp[i] <= ceiling]
+                if viable:
+                    viable.sort(key=lambda x: -x[1])
+                    chosen = cand_texts[viable[0][0]]
+                    is_fallback = True
+                else:
+                    self.distractor = "x-x-x"
+                    return "x-x-x"
         else:
             # No LM: fall back to tier + freq proximity.
             order = sorted(range(n_cand), key=lambda i: (
@@ -1123,6 +1191,8 @@ class Label:
 
         if target_punct and not _PUNCT_FINAL.search(chosen):
             chosen += target_punct
+        if is_fallback:
+            chosen = "*" + chosen
         self.distractor = chosen
         return chosen
 
@@ -1366,6 +1436,8 @@ def run_maze_japanese(
     if outformat not in ("delim", "ibex"):
         raise ValueError(f"Unknown format: {outformat!r}")
 
+    print(f"maze_japanese.py v{__version__}")
+
     if seed is not None:
         random.seed(seed)
         print(f"Random seed set to {seed}")
@@ -1483,9 +1555,10 @@ def validate_output(output_file: str, verbose: bool = False) -> int:
         print("ERROR: No data rows found.")
         return 1
 
-    all_d, issues, weak_samples = [], [], []
+    all_d, issues, weak_samples, fallback_samples = [], [], [], []
     bound_leaks, nsfw_leaks, sokuon_leaks, singlechar = [], [], [], []
     punct_fails = 0
+    fallback_count = 0
     strength = Counter()
 
     for row in rows:
@@ -1502,9 +1575,16 @@ def validate_output(output_file: str, verbose: bool = False) -> int:
                 singlechar.append(f"{tag};{iid} pos {i}: word='{w}'")
             if d == "x-x-x":
                 continue
-            all_d.append(d)
-            stem = RepeatCounter._extract_stem(d)
-            if bool(_PUNCT_FINAL.search(w)) != bool(_PUNCT_FINAL.search(d)):
+            # An asterisk prefix marks a fallback (bypassed strict rules).
+            is_fb = d.startswith("*")
+            d_clean = d[1:] if is_fb else d
+            if is_fb:
+                fallback_count += 1
+                if len(fallback_samples) < 10:
+                    fallback_samples.append(f"  {tag};{iid} pos {i}: '{w}' → '{d}'")
+            all_d.append(d_clean)
+            stem = RepeatCounter._extract_stem(d_clean)
+            if bool(_PUNCT_FINAL.search(w)) != bool(_PUNCT_FINAL.search(d_clean)):
                 punct_fails += 1
                 if verbose:
                     issues.append(f"  {tag};{iid} pos {i}: punct mismatch '{w}' vs '{d}'")
@@ -1514,7 +1594,7 @@ def validate_output(output_file: str, verbose: bool = False) -> int:
                 sokuon_leaks.append(f"{tag};{iid} pos {i}: '{d}' (stem='{stem}')")
             if stem in _BLOCKED_WORDS and stem not in _MORPHOLOGICAL_BLOCKED:
                 nsfw_leaks.append(f"{tag};{iid} pos {i}: '{d}' (stem='{stem}')")
-            s = _val_classify(w, d, words[:i])
+            s = _val_classify(w, d_clean, words[:i])
             strength[s] += 1
             if s == "WEAK" and len(weak_samples) < 10:
                 weak_samples.append(f"  {tag};{iid} pos {i}: '{w}' → '{d}'")
@@ -1537,7 +1617,8 @@ def validate_output(output_file: str, verbose: bool = False) -> int:
     print(f"  Distractors:        {n}  (excluding x-x-x)")
     print(f"  Unique distractors: {len(set(all_d))}  ({100*len(set(all_d))/n:.0f}%)")
     print(f"  Unique stems:       {len(set(stems))}  ({100*len(set(stems))/n:.0f}%)")
-    print(f"  Katakana words:     {kata}  ({100*kata/n:.0f}%)\n")
+    print(f"  Katakana words:     {kata}  ({100*kata/n:.0f}%)")
+    print(f"  Fallback (*-marked):{fallback_count:4d}  ({100*fallback_count/n:.0f}%)  [manual review recommended]\n")
     print(f"  Violation strength:")
     print(f"      STRONG  (double-が/を)    {strong:4d}  ({100*strong/n:.0f}%)")
     print(f"      MEDIUM  (weak-dup / POS)  {medium:4d}  ({100*medium/n:.0f}%)")
@@ -1573,6 +1654,10 @@ def validate_output(output_file: str, verbose: bool = False) -> int:
     print(f"\n  Top 10 repeated stems:")
     for s, c in top_stems:
         print(f"      {s:12s}  ×{c}")
+    if fallback_samples:
+        print(f"\n  Fallback (*-marked) examples — review these:")
+        for fs in fallback_samples[:10]:
+            print(fs)
     if issues:
         print(f"\n  Other issues ({len(issues)}):")
         for iss in issues[:20]:
@@ -1585,7 +1670,9 @@ def validate_output(output_file: str, verbose: bool = False) -> int:
 
 def _cli():
     ap = argparse.ArgumentParser(
-        description="Generate or validate G-Maze distractors for Japanese stimuli")
+        description=f"Generate or validate G-Maze distractors for Japanese stimuli (v{__version__})")
+    ap.add_argument("--version", action="version",
+                    version=f"%(prog)s {__version__}")
     ap.add_argument("input",  nargs="?", default="input.txt",
                     help="Input file (default: input.txt). Ignored with --validate.")
     ap.add_argument("output", nargs="?",
