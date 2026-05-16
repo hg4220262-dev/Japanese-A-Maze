@@ -1,15 +1,8 @@
 # Japanese A-Maze
-
-A surprisal-based distractor generator for the **Grammaticality Maze (G-Maze)** psycholinguistic task in Japanese.
-
+A surprisal-based distractor generator for the G-Maze psycholinguistic task in Japanese.
 Inspired by the English/French A-Maze of Boyce, Futrell & Levy (2020); rebuilt around Japanese-specific structural constraints (particle clashes, POS-mismatch by slot type, bunsetsu-level segmentation) and an autoregressive language model (`rinna/japanese-gpt2-medium`) for surprisal scoring.
 
-Current version: **0.9.0**
-
----
-
 ## Quick start
-
 ```bash
 # 1. Install dependencies
 python -m venv .venv
@@ -22,10 +15,7 @@ python maze_japanese.py input.txt output.txt --seed 42
 # 3. Validate the output
 python maze_japanese.py --validate output.txt
 ```
-
-First run takes a few minutes — it builds and caches the ~157k-bunsetsu pool (`.bunsetsu_pool_*.pkl`) and downloads the LM (~1.2 GB) on first use.
-
----
+First run will take a few minutes as it builds and caches the ~157k-bunsetsu pool (`.bunsetsu_pool_*.pkl`) and downloads the LM (~1.2 GB) on first use.
 
 ## Input format
 
