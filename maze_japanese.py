@@ -132,7 +132,7 @@ _BLOCKLIST_URLS = [
     "https://raw.githubusercontent.com/LDNOOBWV2/"
     "List-of-Dirty-Naughty-Obscene-and-Otherwise-Bad-Words_V2/main/data/ja.txt",
 ]
-_BLOCKLIST_CACHE = os.path.join(_SCRIPT_DIR, ".blocklist_ja_cache.txt")
+_BLOCKLIST_CACHE = os.path.join(_SCRIPT_DIR, "blocklist_ja_cache.txt")
 
 _SUPPLEMENT_B64 = (
     "H4sIAGDK6GkC/1VX2W4qORB9r78a6T7OHWk00nwPbSesIQkQ9oRAIISQhJ2whOVjTG9/MbW4"
@@ -691,7 +691,7 @@ class JapaneseDistractorDict:
 
         cache_path = os.path.join(
             os.path.dirname(os.path.abspath(__file__)),
-            f".bunsetsu_pool_v{_POOL_CACHE_VERSION}_g{grade_level}.pkl",
+            f"bunsetsu_pool_v{_POOL_CACHE_VERSION}_g{grade_level}.pkl",
         )
         if os.path.isfile(cache_path):
             try:

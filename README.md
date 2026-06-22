@@ -5,9 +5,10 @@ Inspired by the English/French A-Maze of Boyce, Futrell & Levy (2020); rebuilt a
 ## Quick start
 ```bash
 # 1. Install dependencies
-python -m venv .venv
-source .venv/bin/activate
+python -m venv venv
+source venv/bin/activate
 pip install -r requirements.txt
+pip install sentencepiece protobuf
 
 # 2. Generate distractors
 python maze_japanese.py input.txt output.txt --seed 42
