@@ -1,8 +1,12 @@
 """Japanese G-Maze distractor generator (Boyce et al. 2020 design).
 
 Usage:
-    python maze_japanese.py input.txt output.txt [--seed N] [-p params.txt]
+    python maze_japanese.py input.csv output.txt [--seed N] [-p params.txt]
+        (params.txt next to this script is read automatically if -p is omitted)
+        [--format inspect|delim|ibex]
     python maze_japanese.py --validate output.txt [-v]
+
+input.csv: comma-separated with a header row: item,condition,sentence[,labels]
 """
 
 __version__ = "0.9.0"
@@ -49,12 +53,13 @@ DEFAULT_MODEL_NAME = "rinna/japanese-gpt2-medium"
 DEFAULT_PARAMS: Dict = {
     "num_to_test":      80,    # max candidates per slot
     "max_repeat":        0,    # max reuses of exact form (0 = stem-cap only)
-    "grade_level":       6,    # kanji filter: 0 = off, 1-6 = elementary grade
+    "grade_level":       0,    # kanji filter: 0 = off, 1-6 = elementary grade
     "use_lm":         True,    # rank candidates by LM surprisal
     "model_name":     DEFAULT_MODEL_NAME,
     "min_surprisal":  14.0,    # bits — distractor must surprise the LM by ≥ this
     "surprisal_ceiling": 35.0, # bits — above this means LM-OOV (unreliable)
     "freq_match_band": 2.0,    # log-freq tolerance vs target_freq
+    "n_candidates":      3,    # distractor lines per sentence in inspect output
 }
 
 
@@ -901,6 +906,7 @@ class JapaneseDistractorDict:
         target_freq: float = 0.0,
         is_final: bool = False,
         prev_particle: str = "",
+        improbable: Optional[set] = None,
     ) -> List[tuple]:
         """Return (bunsetsu, tier, freq) triples to be re-ranked by surprisal.
 
@@ -956,7 +962,8 @@ class JapaneseDistractorDict:
                         seen.add(e.text)
         else:
             # Nominal / non-final verb / final-after-が・は: noun + improbable particle.
-            improbable = _improbable_particles_for_position(prior_particles)
+            if improbable is None:
+                improbable = _improbable_particles_for_position(prior_particles)
             for e in freq_entries:
                 if e.pos == "noun" and e.particle in improbable and _ok(e):
                     tier = (1 if (e.particle in _STRONG_DUPLICATE_PARTICLES
@@ -1055,6 +1062,7 @@ class Sentence:
         self.tag = tag
         self.distractors: List[str] = ["x-x-x"]   # first position always x-x-x
         self.distractor_sentence: str = ""
+        self.alt_distractor_sentences: List[str] = []   # 2nd, 3rd, ... choices
 
     @property
     def word_sentence(self) -> str:
@@ -1074,6 +1082,8 @@ class Label:
         self.words: List[str] = []
         self.prefixes: List[str] = []  # raw text prefix per sentence in this item
         self.distractor: str = "x-x-x"
+        self.ranked: List[str] = []            # all candidates, best first
+        self.alternatives: List[str] = []      # 2nd, 3rd, ... choices
 
     def add_sentence(self, word: str, prefix: str = ""):
         self.words.append(word)
@@ -1089,6 +1099,7 @@ class Label:
         target_pos: str,
         is_final: bool = False,
         prev_particle: str = "",
+        improbable: Optional[set] = None,
     ) -> str:
         """Select the best distractor for this label position."""
         if all(not _JP_RE.search(w) for w in self.words):
@@ -1109,6 +1120,7 @@ class Label:
             target_freq=target_freq,
             is_final=is_final,
             prev_particle=prev_particle,
+            improbable=improbable,
         )
         is_fallback = False
         if not candidates:
@@ -1165,34 +1177,40 @@ class Label:
                 in_band = abs(cand_freq[i] - target_freq) <= band
                 scored.append((cand_texts[i], s, cand_tier[i], in_band))
 
+            # ranked: [(text, is_fallback)] best first.  ranked[0] is the
+            # distractor that is actually used; the rest are alternatives.
+            ranked: List[tuple] = []
             if scored:
                 # Sort: in-band first, then highest surprisal, then strongest tier.
                 scored.sort(key=lambda x: (not x[3], -x[1], x[2]))
-                chosen = scored[0][0]
-            else:
-                # Nothing passed the surprisal gate — pick the candidate with the
-                # highest in-range surprisal anyway, marked as a fallback.
-                viable = [(i, min_surp[i]) for i in range(n_cand)
-                          if min_surp[i] != float("inf") and min_surp[i] <= ceiling]
-                if viable:
-                    viable.sort(key=lambda x: -x[1])
-                    chosen = cand_texts[viable[0][0]]
-                    is_fallback = True
-                else:
-                    self.distractor = "x-x-x"
-                    return "x-x-x"
+                ranked = [(x[0], is_fallback) for x in scored]
+            # Candidates that failed the surprisal gate but are below the
+            # ceiling: used as the answer only if nothing passed the gate,
+            # otherwise only to fill up the alternatives.  Marked as fallback.
+            in_scored = {x[0] for x in scored}
+            viable = [(i, min_surp[i]) for i in range(n_cand)
+                      if min_surp[i] != float("inf") and min_surp[i] <= ceiling
+                      and cand_texts[i] not in in_scored]
+            viable.sort(key=lambda x: -x[1])
+            ranked += [(cand_texts[i], True) for i, _ in viable]
+            if not ranked:
+                self.distractor = "x-x-x"
+                return "x-x-x"
         else:
             # No LM: fall back to tier + freq proximity.
             order = sorted(range(n_cand), key=lambda i: (
                 cand_tier[i],
                 abs(cand_freq[i] - target_freq) + random.random() * 0.05,
             ))
-            chosen = cand_texts[order[0]]
+            ranked = [(cand_texts[i], is_fallback) for i in order]
 
-        if target_punct and not _PUNCT_FINAL.search(chosen):
-            chosen += target_punct
-        if is_fallback:
-            chosen = "*" + chosen
+        def _finish(text: str, fb: bool) -> str:
+            if target_punct and not _PUNCT_FINAL.search(text):
+                text += target_punct
+            return ("*" + text) if fb else text
+
+        self.ranked = [_finish(t, fb) for t, fb in ranked]
+        chosen = self.ranked[0]
         self.distractor = chosen
         return chosen
 
@@ -1236,41 +1254,59 @@ class SentenceSet:
         """Select distractors for every label, clause-aware."""
         banned = repeats.banned[:]
 
-        first = self.sentences[0] if self.sentences else None
+        # Context is computed for EVERY condition, not just the first one, and
+        # merged per label: a shared distractor must be a violation in all the
+        # contexts where its target word appears (e.g. scrambled conditions).
+        ctx_lists: Dict = {}
+        if tokenizer:
+            for sent in self.sentences:
+                running_particles: List[str] = []
+                prev_particle = ""
+                n_words = len(sent.words)
+                for i, w in enumerate(sent.words):
+                    lab = sent.labels[i]
+                    info = tokenizer.get_bunsetsu_info(w)
+
+                    # Reset particle accumulation only at a true clause
+                    # boundary — a bunsetsu ending with 。！？.  Embedded verbs
+                    # do NOT reset, so later slots still see earlier particles.
+                    if w.rstrip().endswith(("。", "！", "？")) and i < n_words - 1:
+                        running_particles = []
+
+                    if i > 0 and lab in self.label_ids:
+                        ctx_lists.setdefault(lab, []).append({
+                            "prior": list(running_particles),
+                            "pos": info["pos"],
+                            "is_final": (i == n_words - 1),
+                            "prev_particle": prev_particle,
+                        })
+                    p = info["particle"]
+                    matched = ""
+                    for cp in _ALL_PARTICLES_SORTED:
+                        if p.startswith(cp):
+                            running_particles.append(cp)
+                            matched = cp
+                            break
+                    prev_particle = matched
+
         label_ctx: Dict = {}
-        if first and tokenizer:
-            running_particles: List[str] = []
-            prev_particle = ""
-            n_words = len(first.words)
-            for i, w in enumerate(first.words):
-                lab = first.labels[i]
-                info = tokenizer.get_bunsetsu_info(w)
-
-                # Reset particle accumulation only at a true clause boundary —
-                # a bunsetsu ending with sentence-final punctuation (。！？).
-                # Embedded verbs (te-form, participial, periphrastic) within a
-                # complex sentence do NOT reset, so subsequent slots can still
-                # see earlier particles as candidates for the improbable-particle
-                # rule.  Without this, complex sentences accumulate many slots
-                # with empty priors and yield x-x-x.
-                if w.rstrip().endswith(("。", "！", "？")) and i < n_words - 1:
-                    running_particles = []
-
-                if lab in self.label_ids:
-                    label_ctx[lab] = {
-                        "prior": list(running_particles),
-                        "pos": info["pos"],
-                        "is_final": (i == n_words - 1),
-                        "prev_particle": prev_particle,
-                    }
-                p = info["particle"]
-                matched = ""
-                for cp in _ALL_PARTICLES_SORTED:
-                    if p.startswith(cp):
-                        running_particles.append(cp)
-                        matched = cp
-                        break
-                prev_particle = matched
+        for lab, cl in ctx_lists.items():
+            # Particles improbable in every context.
+            improbable = set.intersection(
+                *[_improbable_particles_for_position(c["prior"]) for c in cl])
+            # Particles seen before the slot in every context (strong-dup tier).
+            common_prior = set.intersection(*[set(c["prior"]) for c in cl])
+            # が/は BAN applies if it applies in any context (conservative).
+            prev = next((c["prev_particle"] for c in cl
+                         if c["prev_particle"] in ("が", "は")),
+                        cl[0]["prev_particle"])
+            label_ctx[lab] = {
+                "prior": sorted(common_prior),
+                "improbable": improbable,
+                "pos": cl[0]["pos"],
+                "is_final": all(c["is_final"] for c in cl),
+                "prev_particle": prev,
+            }
 
         sentence_banned: set = set()
 
@@ -1283,6 +1319,7 @@ class SentenceSet:
                 target_pos=ctx.get("pos", "other"),
                 is_final=ctx.get("is_final", False),
                 prev_particle=ctx.get("prev_particle", ""),
+                improbable=ctx.get("improbable"),
             )
             stem = RepeatCounter._extract_stem(dist)
             sentence_banned.add(dist)
@@ -1293,10 +1330,43 @@ class SentenceSet:
             banned.append(dist)
             repeats.increment(dist)
 
+        # Alternatives (2nd, 3rd, ... choice) per label.  They are not used in
+        # the experiment, so they do not enter the run-wide banned list, but
+        # each one must differ (by stem) from every 1st choice in this item and
+        # from the other alternatives on the same rank line.
+        n_alt = max(0, int(params.get("n_candidates", 3)) - 1)
+        first_stems = {RepeatCounter._extract_stem(l.distractor.lstrip("*"))
+                       for l in self.labels.values()}
+        rank_stems: List[set] = [set() for _ in range(n_alt)]
+        banned_set = set(banned)
+        for label in self.labels.values():
+            alts: List[str] = []
+            used = set(first_stems)
+            pool = label.ranked[1:] if label.distractor != "x-x-x" else []
+            for r in range(n_alt):
+                pick = "x-x-x"
+                for c in pool:
+                    st = RepeatCounter._extract_stem(c.lstrip("*"))
+                    if st in used or st in rank_stems[r]:
+                        continue
+                    if c in banned_set:
+                        continue
+                    pick = c
+                    used.add(st)
+                    rank_stems[r].add(st)
+                    break
+                alts.append(pick)
+            label.alternatives = alts
+
         for s in self.sentences:
             for i in range(1, len(s.labels)):
                 s.distractors.append(self.labels[s.labels[i]].distractor)
             s.distractor_sentence = " ".join(s.distractors)
+            s.alt_distractor_sentences = [
+                " ".join(["x-x-x"] + [self.labels[s.labels[i]].alternatives[r]
+                                      for i in range(1, len(s.labels))])
+                for r in range(n_alt)
+            ]
 
     def clean_up(self):
         """Free memory after distractor selection is complete."""
@@ -1345,42 +1415,202 @@ class RepeatCounter:
             self._ban_stem_variants(stem)
 
 
+def _open_csv_text(filename: str) -> List[str]:
+    """Read a CSV file as text lines; UTF-8 (with/without BOM), else Shift-JIS."""
+    for enc in ("utf-8-sig", "cp932"):
+        try:
+            with open(filename, encoding=enc, newline="") as f:
+                return f.read().splitlines()
+        except UnicodeDecodeError:
+            continue
+    raise ValueError(f"{filename}: cannot decode as UTF-8 or Shift-JIS")
+
+
 def read_input(
     filename: str,
     tokenizer: Optional[JapaneseTokenizer] = None,
 ) -> Dict[str, SentenceSet]:
-    """Read semicolon-delimited input file into SentenceSet objects."""
+    """Read input.csv (comma-separated; header row optional).
+
+    Required columns : item, condition, sentence
+    Optional column  : labels  (space-separated, one label per bunsetsu)
+
+    - Rows with the same item are the conditions of one item; they share
+      distractors at positions that carry the same label.
+    - Without labels, identical bunsetsu share a label across conditions
+      (see _auto_labels), so a scrambled word keeps its distractor.
+    - sentence: if it contains ASCII spaces it is treated as pre-segmented
+      bunsetsu; otherwise it is auto-segmented with MeCab.
+    - The header row may be omitted; then the columns are taken in the order
+      item, condition, sentence[, labels].
+    - Blank rows and rows whose item starts with '#' are skipped.
+    - Encoding: UTF-8 (Excel's "CSV UTF-8" included) or Shift-JIS.
+    """
+    lines = _open_csv_text(filename)
+    _COLS = ["item", "condition", "sentence", "labels"]
+    first = next(csv.reader(lines[:1]), []) if lines else []
+    first_norm = [h.strip().lower() for h in first]
+    if {"item", "condition", "sentence"} <= set(first_norm):
+        reader = csv.DictReader(lines[1:], fieldnames=first_norm)
+        first_lineno = 2
+    elif any(h in _COLS for h in first_norm):
+        raise ValueError(
+            f"{filename}: header must contain item, condition, sentence "
+            f"(found: {first_norm})"
+        )
+    else:
+        # No header row: columns are item, condition, sentence[, labels].
+        reader = csv.DictReader(lines, fieldnames=_COLS)
+        first_lineno = 1
+    has_labels = "labels" in reader.fieldnames
+
+    rows_by_item: Dict[str, list] = {}
+    for lineno, row in enumerate(reader, first_lineno):
+        item_id = (row.get("item") or "").strip()
+        cond    = (row.get("condition") or "").strip()
+        sent    = (row.get("sentence") or "").strip()
+        if not item_id and not sent:
+            continue
+        if item_id.startswith("#"):
+            continue
+        if not item_id or not cond or not sent:
+            raise ValueError(f"{filename} line {lineno}: item, condition and "
+                             f"sentence must all be filled in")
+
+        if " " in sent:
+            words = sent.split()
+        else:
+            if tokenizer is None:
+                tokenizer = JapaneseTokenizer()
+            words = tokenizer.tokenize(sent)
+
+        lab_text = (row.get("labels") or "").strip() if has_labels else ""
+        labels = None
+        if lab_text:
+            labels = lab_text.split()
+            if len(labels) != len(words):
+                raise ValueError(
+                    f"{filename} line {lineno}: label count ({len(labels)}) != "
+                    f"bunsetsu count ({len(words)}) for item {item_id} "
+                    f"condition {cond}: {' '.join(words)}"
+                )
+
+        rows_by_item.setdefault(item_id, [])
+        if any(r[0] == cond for r in rows_by_item[item_id]):
+            raise ValueError(f"{filename} line {lineno}: item {item_id} has "
+                             f"condition {cond} twice")
+        rows_by_item[item_id].append((cond, words, labels, lineno))
+
     all_sets: Dict[str, SentenceSet] = {}
-    with open(filename, encoding="utf-8") as f:
-        reader = csv.reader(f, delimiter=";", quotechar='"')
-        for row in reader:
-            if not row or row[0].startswith("#"):
-                continue
-            tag     = row[0].strip()
-            item_id = row[1].strip()
-            sent    = row[2].strip()
-
-            if " " in sent:
-                words = sent.split()
-            else:
-                if tokenizer is None:
-                    tokenizer = JapaneseTokenizer()
-                words = tokenizer.tokenize(sent)
-
-            if len(row) > 3 and row[3].strip():
-                labels = row[3].strip().split()
-                if len(labels) != len(words):
-                    raise ValueError(
-                        f"Label count ({len(labels)}) != word count ({len(words)}) "
-                        f"for item {item_id}"
-                    )
-            else:
-                labels = list(range(len(words)))
-
-            if item_id not in all_sets:
-                all_sets[item_id] = SentenceSet(item_id)
-            all_sets[item_id].add(Sentence(words, labels, item_id, tag))
+    for item_id, rows in rows_by_item.items():
+        given = [r[2] is not None for r in rows]
+        if any(given) and not all(given):
+            raise ValueError(f"{filename} line {rows[0][3]}: item {item_id}: "
+                             f"fill in labels for all conditions or for none")
+        if not any(given):
+            auto = _auto_labels([r[1] for r in rows])
+            rows = [(c, w, l, n) for (c, w, _, n), l in zip(rows, auto)]
+        ss = SentenceSet(item_id)
+        for cond, words, labels, _ in rows:
+            ss.add(Sentence(words, labels, item_id, cond))
+        all_sets[item_id] = ss
     return all_sets
+
+
+def _auto_labels(sentences: List[List[str]]) -> List[List[int]]:
+    """Label bunsetsu so that the same word gets the same label in every
+    condition of an item, even when the word order is scrambled.
+
+    - Identical bunsetsu (same text; k-th occurrence matched with k-th) share
+      a label, hence share one distractor across conditions.
+    - Bunsetsu that occur in only one condition get a label of their own.
+    - A sentence-initial bunsetsu always gets its own label: it has no
+      distractor (x-x-x), so it must not be tied to a word that needs one
+      in another condition.
+    Labels are integers in order of first appearance.
+    """
+    keys_per_sent: List[List[tuple]] = []
+    for words in sentences:
+        seen: Dict[str, int] = {}
+        keys = []
+        for w in words:
+            seen[w] = seen.get(w, 0) + 1
+            keys.append((w, seen[w]))
+        keys_per_sent.append(keys)
+
+    ids: Dict[tuple, int] = {}
+    out: List[List[int]] = []
+    nxt = 0
+    for si, keys in enumerate(keys_per_sent):
+        labs = []
+        for pos, key in enumerate(keys):
+            k = ("<first>", si) if pos == 0 else key
+            if k not in ids:
+                ids[k] = nxt
+                nxt += 1
+            labs.append(ids[k])
+        out.append(labs)
+    return out
+
+
+def save_inspect(outfile: str, all_sets: Dict[str, SentenceSet]):
+    """Write a readable output for manual inspection:
+
+        # item=<item> condition=<condition>
+        <words>
+        <1st-choice distractors>;<labels>
+        <2nd-choice distractors>;<labels>
+        <3rd-choice distractors>;<labels>     (n_candidates lines in total)
+
+    'x-x-x' in a 2nd/3rd line means no further candidate was available.
+
+    The sentence and distractor lines start at the beginning of the line, so
+    each distractor sits directly under the bunsetsu it belongs to.
+    """
+    with open(outfile, "w", encoding="utf-8") as f:
+        for ss in all_sets.values():
+            for s in ss.sentences:
+                f.write(f"# item={s.id} condition={s.tag}\n")
+                f.write(f"{s.word_sentence}\n")
+                f.write(f"{s.distractor_sentence};{s.label_sentence}\n")
+                for alt in s.alt_distractor_sentences:
+                    f.write(f"{alt};{s.label_sentence}\n")
+
+
+_INSPECT_HEADER = re.compile(r"#\s*item=(\S*)\s+condition=(\S*)")
+
+
+def _read_output_rows(output_file: str) -> List[List[str]]:
+    """Read an output file as [condition, item, words, distractors, labels] rows.
+
+    Accepts both the inspect format and the semicolon-delimited format.
+    """
+    with open(output_file, encoding="utf-8-sig") as f:
+        raw = [l.rstrip("\n") for l in f if l.strip()]
+    body = [l for l in raw if not l.startswith("#")]
+    if body and ";" not in body[0]:
+        rows = []
+        tag, iid = "s", ""
+        pending = None
+        taken = False
+        n = 0
+        for l in raw:
+            m = _INSPECT_HEADER.match(l)
+            if m:
+                iid, tag = m.group(1), m.group(2)
+                continue
+            if l.startswith("#"):
+                continue
+            if not l.startswith("x-x-x"):
+                pending = l          # sentence line
+                taken = False
+            elif pending is not None and not taken:
+                n += 1               # 1st-choice line (alternatives are skipped)
+                dist, _, labs = l.partition(";")
+                rows.append([tag, iid or str(n), pending, dist, labs])
+                taken = True
+        return rows
+    return [row for row in csv.reader(body, delimiter=";", quotechar='"') if row]
 
 
 def save_delim(outfile: str, all_sets: Dict[str, SentenceSet]):
@@ -1406,11 +1636,21 @@ def save_ibex(outfile: str, all_sets: Dict[str, SentenceSet]):
                 )
 
 
+_DEFAULT_PARAMS_FILE = os.path.join(_SCRIPT_DIR, "params.txt")
+
+
 def load_params(params_file: Optional[str]) -> Dict:
-    """Load runtime parameters from a key:value text file."""
+    """Load runtime parameters from a key:value text file.
+
+    If no file is given with -p, params.txt in the same folder as this script
+    is used when it exists; otherwise DEFAULT_PARAMS are used as they are.
+    """
     params = dict(DEFAULT_PARAMS)
     if params_file is None:
-        return params
+        if not os.path.isfile(_DEFAULT_PARAMS_FILE):
+            return params
+        params_file = _DEFAULT_PARAMS_FILE
+    print(f"Using params file: {params_file}")
     with open(params_file, encoding="utf-8") as f:
         for line in f:
             line = line.strip()
@@ -1429,11 +1669,11 @@ def run_maze_japanese(
     infile: str,
     outfile: str,
     params_file: Optional[str] = None,
-    outformat: str = "delim",
+    outformat: str = "inspect",
     seed: Optional[int] = None,
 ):
     """End-to-end pipeline: load → distractors → write → report."""
-    if outformat not in ("delim", "ibex"):
+    if outformat not in ("inspect", "delim", "ibex"):
         raise ValueError(f"Unknown format: {outformat!r}")
 
     print(f"maze_japanese.py v{__version__}")
@@ -1473,6 +1713,8 @@ def run_maze_japanese(
     print(f"Writing {outformat} output to {outfile!r}...")
     if outformat == "ibex":
         save_ibex(outfile, all_sets)
+    elif outformat == "inspect":
+        save_inspect(outfile, all_sets)
     else:
         save_delim(outfile, all_sets)
 
@@ -1546,11 +1788,7 @@ def _val_classify(word: str, distractor: str, prior_words: List[str]) -> str:
 
 def validate_output(output_file: str, verbose: bool = False) -> int:
     """Validate G-Maze distractor output quality. Returns 0 on pass, 1 on issues."""
-    rows = []
-    with open(output_file, encoding="utf-8") as f:
-        for row in csv.reader(f, delimiter=";", quotechar='"'):
-            if row and not row[0].startswith("#"):
-                rows.append(row)
+    rows = _read_output_rows(output_file)
     if not rows:
         print("ERROR: No data rows found.")
         return 1
@@ -1673,8 +1911,8 @@ def _cli():
         description=f"Generate or validate G-Maze distractors for Japanese stimuli (v{__version__})")
     ap.add_argument("--version", action="version",
                     version=f"%(prog)s {__version__}")
-    ap.add_argument("input",  nargs="?", default="input.txt",
-                    help="Input file (default: input.txt). Ignored with --validate.")
+    ap.add_argument("input",  nargs="?", default="input.csv",
+                    help="Input CSV with item,condition,sentence columns (default: input.csv). Ignored with --validate.")
     ap.add_argument("output", nargs="?",
                     help="Output file path (for generate); or file to check with --validate")
     ap.add_argument("--validate", action="store_true",
@@ -1682,9 +1920,11 @@ def _cli():
     ap.add_argument("-v", "--verbose", action="store_true",
                     help="Show per-position detail (validate mode)")
     ap.add_argument("-p", "--params", default=None,
-                    help="Parameters file (key:value format)")
-    ap.add_argument("--format", choices=["delim", "ibex"], default="delim",
-                    help="Output format (default: delim)")
+                    help="Parameters file (key:value format). Default: params.txt "
+                         "in the same folder as this script, if present")
+    ap.add_argument("--format", choices=["inspect", "delim", "ibex"], default="inspect",
+                    help="Output format (default: inspect = sentence line + "
+                         "distractor;labels line)")
     ap.add_argument("--log", default="WARNING",
                     help="Logging level (DEBUG, INFO, WARNING)")
     ap.add_argument("--seed", type=int, default=None,

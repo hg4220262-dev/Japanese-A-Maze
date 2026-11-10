@@ -1,0 +1,15 @@
+# Parameter file for maze_japanese.py
+# Keep this file in the same folder as maze_japanese.py: it is read automatically.
+# To use a different file: python maze_japanese.py input.csv output.txt -p other.txt
+# Format: "key: value". Keys left out keep their DEFAULT_PARAMS value.
+# Values are read as Python literals (True/False, numbers, "strings").
+
+num_to_test: 80            # max candidates tried per position
+max_repeat: 0              # max reuses of the exact same form (0 = stem cap only)
+grade_level: 0             # kanji filter: 0 = off, 1-6 = elementary school grade
+use_lm: True               # rank candidates by LM surprisal
+model_name: "rinna/japanese-gpt2-medium"
+min_surprisal: 14.0        # bits; a distractor must surprise the LM at least this much
+surprisal_ceiling: 35.0    # bits; above this the LM score is treated as unreliable
+freq_match_band: 2.0       # allowed log-frequency difference from the target word
+n_candidates: 3            # distractor lines per sentence (1st choice + alternatives)
